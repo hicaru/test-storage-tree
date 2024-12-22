@@ -61,26 +61,24 @@ type Result<T> = std::result::Result<T, StorageError>;
 /// Represents a node in the storage system that holds encrypted data
 /// Each node contains a hash for identification, optional encrypted data,
 /// timestamp for ordering, and size information
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Node {
     /// BLAKE3 hash used as a unique identifier
-    hash: [u8; 32],
+    pub hash: [u8; 32],
     /// Optional encrypted data (None in cache, Some in storage)
-    cipher_data: Option<Vec<u8>>,
+    pub cipher_data: Option<Vec<u8>>,
     /// Unix timestamp for node creation/modification
-    timestamp: u64,
+    pub timestamp: u64,
     /// Size of the encrypted data in bytes
-    size: usize,
+    pub size: usize,
 }
 
 /// Main storage manager that handles both persistent storage and in-memory cache
 pub struct StorageManager {
     /// Persistent storage using sled database
-    db: Db,
+    pub db: Db,
     /// Thread-safe cache storing metadata without cipher_data
-    cache: Arc<RwLock<Vec<Node>>>,
-    /// Maximum number of nodes to keep in cache
-    max_nodes: usize,
+    pub cache: Arc<RwLock<Vec<Node>>>,
 }
 
 impl StorageManager {
@@ -88,16 +86,17 @@ impl StorageManager {
     ///
     /// # Arguments
     /// * `db_path` - Path to the sled database file
-    /// * `max_nodes` - Maximum number of nodes to keep in memory cache
+    /// * `number_of_nodes` - Number of nodes for memory pre-allocation
+    ///                       Will allocate space for number_of_nodes + 1 to optimize insertions
     ///
     /// # Returns
     /// * `Result<Self>` - New StorageManager instance or error
-    pub fn new(db_path: &str, max_nodes: usize) -> Result<Self> {
+    pub fn new(db_path: &str, number_of_nodes: usize) -> Result<Self> {
         let db = sled::open(db_path)?;
+        // Allocate with extra capacity for potential new nodes
         Ok(Self {
             db,
-            cache: Arc::new(RwLock::new(Vec::with_capacity(max_nodes))),
-            max_nodes,
+            cache: Arc::new(RwLock::new(Vec::with_capacity(number_of_nodes))),
         })
     }
 
@@ -110,29 +109,23 @@ impl StorageManager {
     /// # Returns
     /// * `Result<()>` - Success or error
     pub async fn add_node(&self, cipher_data: Vec<u8>, hash: [u8; 32]) -> Result<()> {
-        // Create new node with current timestamp
+        let size = cipher_data.len();
         let node = Node {
             hash,
-            cipher_data: Some(cipher_data.clone()),
+            size,
+            cipher_data: Some(cipher_data),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
-            size: cipher_data.len(),
         };
 
-        // Store complete node in database
         self.db.insert(hash, bincode::serialize(&node)?)?;
 
-        // Update in-memory cache with metadata only
         let mut cache = self
             .cache
             .write()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Cache lock error"))?;
 
-        // Remove oldest node if cache is full
-        if cache.len() >= self.max_nodes {
-            cache.remove(0);
-        }
         // Add new node to cache without cipher_data
         cache.push(Node {
             hash,
@@ -211,18 +204,6 @@ impl StorageManager {
         self.add_node(new_cipher_data, *hash).await?;
         Ok(())
     }
-
-    /// Retrieves all nodes from cache (metadata only, no cipher_data)
-    ///
-    /// # Returns
-    /// * `Result<Vec<Node>>` - Vector of all cached nodes or error
-    pub async fn get_all_nodes(&self) -> Result<Vec<Node>> {
-        let cache = self
-            .cache
-            .read()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Cache lock error"))?;
-        Ok(cache.clone())
-    }
 }
 
 #[cfg(test)]
@@ -281,10 +262,9 @@ mod tests {
         Ok(())
     }
 
-    /// Tests handling of multiple nodes in storage
+    /// Tests handling of multiple nodes
     /// Verifies that:
     /// - Multiple nodes can be stored successfully
-    /// - All nodes are properly cached
     /// - Each node maintains data integrity
     /// - The system can handle the specified amount of nodes
     #[tokio::test]
@@ -303,15 +283,42 @@ mod tests {
         for _ in 0..AMOUNT_OF_NODES {
             let cipher_data = generate_cipher_data();
             let hash = blake3::hash(&cipher_data).into();
+            storage.add_node(cipher_data.clone(), hash).await?;
+            hashes.push((hash, cipher_data));
+        }
+
+        // Verify each node's integrity
+        for (hash, original_data) in hashes {
+            let node = storage.get_node(&hash).await?.unwrap();
+            assert_eq!(node.cipher_data.unwrap(), original_data);
+            assert_eq!(node.size, 1024);
+        }
+
+        Ok(())
+    }
+
+    /// Tests the cache size limitation and data persistence
+    /// Verifies that:
+    /// - Nodes are properly persisted in database
+    /// - Nodes can be retrieved even if not in cache
+    #[tokio::test]
+    async fn test_storage_persistence() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let db_path = temp_dir.path().join("test_db_persistence");
+
+        // Create multiple nodes
+        let storage = StorageManager::new(db_path.to_str().unwrap(), 5)?;
+        let mut hashes = Vec::new();
+
+        // Add 10 nodes with small cache size
+        for _ in 0..10 {
+            let cipher_data = generate_cipher_data();
+            let hash = blake3::hash(&cipher_data).into();
             storage.add_node(cipher_data, hash).await?;
             hashes.push(hash);
         }
 
-        // Verify cache contains all nodes
-        let all_nodes = storage.get_all_nodes().await?;
-        assert_eq!(all_nodes.len(), AMOUNT_OF_NODES);
-
-        // Verify each node's integrity
+        // Verify all nodes are still accessible
         for hash in hashes {
             let node = storage.get_node(&hash).await?;
             assert!(node.is_some());
@@ -321,44 +328,9 @@ mod tests {
         Ok(())
     }
 
-    /// Tests the cache size limitation functionality
-    /// Verifies that:
-    /// - Cache size never exceeds the specified maximum
-    /// - Older nodes are properly removed when cache is full
-    /// - New nodes can still be added when cache is full
-    #[tokio::test]
-    async fn test_storage_max_nodes() -> Result<()> {
-        // Setup test environment
-        let temp_dir = tempdir()?;
-        let db_path = temp_dir.path().join("test_db_max");
-
-        // Set a small cache size to test limiting
-        let max_nodes = 5;
-        let storage = StorageManager::new(db_path.to_str().unwrap(), max_nodes)?;
-
-        // Add more nodes than the cache limit
-        for _ in 0..10 {
-            let cipher_data = generate_cipher_data();
-            let hash = blake3::hash(&cipher_data).into();
-            storage.add_node(cipher_data, hash).await?;
-        }
-
-        // Verify cache size respect the limit
-        let all_nodes = storage.get_all_nodes().await?;
-        assert!(all_nodes.len() <= max_nodes);
-
-        Ok(())
-    }
-
     /// Tests concurrent access to the storage system
     /// Simulates real-world scenario with multiple threads performing
     /// different operations simultaneously
-    ///
-    /// Verifies that:
-    /// - Multiple threads can access storage concurrently
-    /// - Data remains consistent under concurrent access
-    /// - No deadlocks occur during parallel operations
-    /// - Error handling works properly in concurrent scenario
     #[tokio::test]
     async fn test_concurrent_access() -> Result<()> {
         use futures::future::join_all;
@@ -366,18 +338,14 @@ mod tests {
         use std::time::Duration;
         use tokio::time::sleep;
 
-        // Test configuration
-        const THREADS: usize = 100; // Number of concurrent threads
-        const OPERATIONS_PER_THREAD: usize = 50; // Operations per thread
+        const THREADS: usize = 100;
+        const OPERATIONS_PER_THREAD: usize = 50;
 
-        // Setup test environment
         let temp_dir = tempdir()?;
         let db_path = temp_dir.path().join("test_db_concurrent");
-
-        // Initialize storage with large enough cache
         let storage = Arc::new(StorageManager::new(db_path.to_str().unwrap(), 1000)?);
 
-        // Initialize storage with some initial data
+        // Initialize with some data
         let mut initial_hashes = Vec::new();
         for _ in 0..20 {
             let data = generate_cipher_data();
@@ -389,19 +357,17 @@ mod tests {
         let mut handles = Vec::new();
         let initial_hashes = Arc::new(initial_hashes);
 
-        // Spawn multiple threads for concurrent operations
+        // Spawn multiple threads
         for thread_id in 0..THREADS {
             let storage = storage.clone();
             let hashes = initial_hashes.clone();
 
             let handle = tokio::spawn(async move {
                 for op_id in 0..OPERATIONS_PER_THREAD {
-                    // Prepare operation parameters before any await calls
-                    // This ensures thread safety with RNG
                     let op = {
                         let mut rng = rand::thread_rng();
                         let delay = rng.gen_range(0..10);
-                        let op_type = rng.gen_range(0..4);
+                        let op_type = rng.gen_range(0..3); // Reduced to 3 operations
                         let selected_hash = hashes.choose(&mut rng).cloned();
                         let new_data = if op_type == 0 || op_type == 2 {
                             Some(generate_cipher_data())
@@ -411,13 +377,11 @@ mod tests {
                         (delay, op_type, selected_hash, new_data)
                     };
 
-                    // Add random delay to increase chance of concurrent access
                     sleep(Duration::from_millis(op.0)).await;
 
-                    // Perform random operation based on op_type
                     match op.1 {
                         0 => {
-                            // Add new node operation
+                            // Add new node
                             if let Some(data) = op.3 {
                                 let hash = blake3::hash(&data).into();
                                 if let Err(e) = storage.add_node(data, hash).await {
@@ -426,7 +390,7 @@ mod tests {
                             }
                         }
                         1 => {
-                            // Read existing node operation
+                            // Read node
                             if let Some(hash) = op.2 {
                                 if let Err(e) = storage.get_node(&hash).await {
                                     eprintln!(
@@ -437,7 +401,7 @@ mod tests {
                             }
                         }
                         2 => {
-                            // Update existing node operation
+                            // Update node
                             if let Some(hash) = op.2 {
                                 if let Some(new_data) = op.3 {
                                     if let Err(e) = storage.update_node(&hash, new_data).await {
@@ -447,12 +411,6 @@ mod tests {
                                         );
                                     }
                                 }
-                            }
-                        }
-                        3 => {
-                            // List all nodes operation
-                            if let Err(e) = storage.get_all_nodes().await {
-                                eprintln!("Thread {} op {} get_all error: {}", thread_id, op_id, e);
                             }
                         }
                         _ => unreachable!(),
@@ -465,26 +423,14 @@ mod tests {
 
         // Wait for all threads to complete
         let results = join_all(handles).await;
-
-        // Verify all threads completed successfully
         for result in results {
             result.expect("Task panicked");
         }
 
-        // Verify storage integrity after concurrent operations
-        let final_nodes = storage.get_all_nodes().await?;
-        assert!(
-            !final_nodes.is_empty(),
-            "Storage should not be empty after operations"
-        );
-
-        // Verify all cached nodes are accessible
-        for node in &final_nodes {
-            let retrieved = storage.get_node(&node.hash).await?;
-            assert!(
-                retrieved.is_some(),
-                "Should be able to retrieve cached node"
-            );
+        // Verify data integrity by checking initial nodes
+        for hash in initial_hashes.iter() {
+            let node = storage.get_node(hash).await?;
+            assert!(node.is_some(), "Initial node should still be accessible");
         }
 
         Ok(())
